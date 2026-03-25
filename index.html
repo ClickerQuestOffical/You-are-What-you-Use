@@ -1,0 +1,1461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>You Are What You Use</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  background: #0a0a0a;
+  width: 100%; height: 100%;
+  display: flex; justify-content: center; align-items: center;
+  overflow: hidden;
+}
+canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ============================================================
+   YOU ARE WHAT YOU USE
+   A 5-10 minute game about easy choices and hard consequences
+   Inspired by "We Become What We Behold"
+   ============================================================ */
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 960, H = 540;
+canvas.width  = W;
+canvas.height = H;
+
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = Math.floor(W * s) + 'px';
+  canvas.style.height = Math.floor(H * s) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Pre-bake noise textures ──────────────────────────────────
+const NOISE_COUNT = 6;
+const noiseCanvases = [];
+for (let n = 0; n < NOISE_COUNT; n++) {
+  const nc = document.createElement('canvas');
+  nc.width = W; nc.height = H;
+  const nctx = nc.getContext('2d');
+  const id = nctx.createImageData(W, H);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const v = (Math.random() * 255) | 0;
+    id.data[i] = id.data[i+1] = id.data[i+2] = v;
+    id.data[i+3] = (Math.random() * 18) | 0;
+  }
+  nctx.putImageData(id, 0, 0);
+  noiseCanvases.push(nc);
+}
+let noiseFrame = 0;
+
+// ── Game State ───────────────────────────────────────────────
+const G = {
+  state   : 'TITLE',
+  time    : 0,
+  sadness : 0,
+  money   : 0,
+  kills   : 0,
+  choices : {}
+};
+
+// Current scene local state
+let scene = {};
+
+// Background NPCs
+let bgNPCs = [];
+
+// ── Transition ───────────────────────────────────────────────
+const TRANS = { alpha: 0, fadingOut: false, fadingIn: false, next: null };
+
+function fadeTo(nextState) {
+  if (TRANS.fadingOut || TRANS.fadingIn) return;
+  TRANS.fadingOut = true;
+  TRANS.alpha = 0;
+  TRANS.next  = nextState;
+}
+
+function updateTransition(dt) {
+  if (TRANS.fadingOut) {
+    TRANS.alpha += dt * 2.4;
+    if (TRANS.alpha >= 1) {
+      TRANS.alpha = 1;
+      TRANS.fadingOut = false;
+      TRANS.fadingIn  = true;
+      startScene(TRANS.next);
+    }
+  } else if (TRANS.fadingIn) {
+    TRANS.alpha -= dt * 1.8;
+    if (TRANS.alpha <= 0) {
+      TRANS.alpha = 0;
+      TRANS.fadingIn = false;
+    }
+  }
+}
+
+function drawTransition() {
+  if (TRANS.alpha <= 0) return;
+  ctx.fillStyle = `rgba(0,0,0,${TRANS.alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ── Dialogue ─────────────────────────────────────────────────
+const DIAL = {
+  active  : false,
+  lines   : [],
+  index   : 0,
+  charI   : 0,
+  speed   : 1/32,
+  timer   : 0,
+  done    : false,
+  callback: null
+};
+
+function startDialogue(lines, cb) {
+  DIAL.active   = true;
+  DIAL.lines    = lines.map(l => typeof l === 'string'
+    ? { text: l, speaker: '' }
+    : l);
+  DIAL.index    = 0;
+  DIAL.charI    = 0;
+  DIAL.timer    = 0;
+  DIAL.done     = false;
+  DIAL.callback = cb || null;
+}
+
+function advanceDialogue() {
+  if (!DIAL.active) return;
+  const full = DIAL.lines[DIAL.index].text;
+  if (!DIAL.done) { DIAL.charI = full.length; DIAL.done = true; return; }
+  DIAL.index++;
+  if (DIAL.index >= DIAL.lines.length) {
+    DIAL.active = false;
+    const cb = DIAL.callback; DIAL.callback = null;
+    if (cb) cb();
+    return;
+  }
+  DIAL.charI = 0; DIAL.done = false; DIAL.timer = 0;
+}
+
+function updateDialogue(dt) {
+  if (!DIAL.active || DIAL.done) return;
+  DIAL.timer += dt;
+  while (DIAL.timer >= DIAL.speed) {
+    DIAL.timer -= DIAL.speed;
+    DIAL.charI++;
+    const full = DIAL.lines[DIAL.index].text;
+    if (DIAL.charI >= full.length) { DIAL.done = true; break; }
+  }
+}
+
+// ── Choice buttons ───────────────────────────────────────────
+const CHOICE = { active: false, options: [] };
+
+// ── Mouse ────────────────────────────────────────────────────
+const MOUSE = { x: 0, y: 0, clicked: false };
+
+function toCanvas(cx, cy) {
+  const r  = canvas.getBoundingClientRect();
+  const sw = parseFloat(canvas.style.width)  || W;
+  const sh = parseFloat(canvas.style.height) || H;
+  return { x: (cx - r.left) * (W / sw), y: (cy - r.top) * (H / sh) };
+}
+
+canvas.addEventListener('mousemove', e => {
+  const p = toCanvas(e.clientX, e.clientY);
+  MOUSE.x = p.x; MOUSE.y = p.y;
+  canvas.style.cursor = 'default';
+});
+
+canvas.addEventListener('click', e => {
+  if (TRANS.fadingOut || TRANS.fadingIn) return;
+  const p = toCanvas(e.clientX, e.clientY);
+  MOUSE.x = p.x; MOUSE.y = p.y;
+
+  // Title screen
+  if (G.state === 'TITLE') { fadeTo('ALLEY'); return; }
+
+  // Alley knife pickup
+  if (G.state === 'ALLEY' && scene.phase === 'knife_offered' && !scene.knifeGone) {
+    const kx = W * 0.42, ky = H * 0.56;
+    if (Math.hypot(MOUSE.x - kx, MOUSE.y - ky) < 38) {
+      scene.knifeGone = true;
+      G.hasKnife = true;
+      scene.phase = 'dying';
+      scene.dyingTimer = 0;
+      DIAL.active = false;
+      return;
+    }
+  }
+
+  // Advance dialogue
+  if (DIAL.active && !CHOICE.active) { advanceDialogue(); return; }
+
+  // Choices
+  if (CHOICE.active && !DIAL.active) {
+    CHOICE.options.forEach(opt => {
+      if (MOUSE.x >= opt._x && MOUSE.x <= opt._x + opt._w &&
+          MOUSE.y >= opt._y && MOUSE.y <= opt._y + opt._h) {
+        doChoice(opt.action);
+      }
+    });
+  }
+});
+
+// ── Choice handler ───────────────────────────────────────────
+function doChoice(action) {
+  CHOICE.active = false;
+  G.choices[action] = true;
+
+  if (action === 'knife_yes') {
+    G.money += 22; G.kills++;
+    startDialogue([
+      { text: 'Done. $22 richer.', speaker: 'YOU' },
+      { text: 'His body hits the pavement. You don\'t look back.', speaker: '' },
+    ], () => fadeTo('PHONE_OFFER'));
+  }
+  if (action === 'knife_no') {
+    G.sadness = Math.min(100, G.sadness + 18);
+    startDialogue([
+      { text: 'You walk past him. The knife stays in your pocket.', speaker: '' },
+      { text: 'Your stomach growls. The sadness sits heavier now.', speaker: '' },
+    ], () => fadeTo('PHONE_OFFER'));
+  }
+  if (action === 'phone_yes') {
+    G.sadness = Math.min(100, G.sadness + 14);
+    startDialogue([
+      { text: 'You pull up her location. She doesn\'t know.', speaker: 'YOU' },
+      { text: 'You know everything. And somehow feel worse.', speaker: '' },
+    ], () => fadeTo('PILLS_OFFER'));
+  }
+  if (action === 'phone_no') {
+    G.sadness = Math.min(100, G.sadness + 22);
+    startDialogue([
+      { text: 'You pocket the phone without using it.', speaker: '' },
+      { text: 'The weight of what you could do presses on you.', speaker: '' },
+    ], () => fadeTo('PILLS_OFFER'));
+  }
+  if (action === 'pills_yes') {
+    G.sadness = Math.max(0, G.sadness - 12);
+    startDialogue([
+      { text: 'You swallow them. The fog comes slowly.', speaker: '' },
+      { text: 'You feel better. You feel nothing.', speaker: '' },
+      { text: 'And somehow, that\'s worse.', speaker: '' },
+    ], () => fadeTo('SOCIAL_OFFER'));
+  }
+  if (action === 'pills_no') {
+    G.sadness = Math.min(100, G.sadness + 16);
+    startDialogue([
+      { text: 'You leave them on the table.', speaker: '' },
+      { text: 'The ache doesn\'t go away on its own.', speaker: '' },
+    ], () => fadeTo('SOCIAL_OFFER'));
+  }
+  if (action === 'social_yes') {
+    G.sadness = Math.min(100, G.sadness + 20);
+    startDialogue([
+      { text: 'You post everything. The likes flood in.', speaker: '' },
+      { text: 'You check it every thirty seconds.', speaker: '' },
+      { text: 'Three hours pass. You don\'t remember any of it.', speaker: '' },
+    ], () => fadeTo('GUN_OFFER'));
+  }
+  if (action === 'social_no') {
+    G.sadness = Math.min(100, G.sadness + 12);
+    startDialogue([
+      { text: 'You close the app. The world feels quieter.', speaker: '' },
+      { text: 'But also further away.', speaker: '' },
+    ], () => fadeTo('GUN_OFFER'));
+  }
+  if (action === 'gun_yes') {
+    G.kills++; G.money += 60;
+    G.sadness = Math.min(100, G.sadness + 30);
+    startDialogue([
+      { text: 'It\'s louder than you expected.', speaker: '' },
+      { text: 'The money is in your hand. Your hand won\'t stop shaking.', speaker: '' },
+    ], () => fadeTo('ENDING'));
+  }
+  if (action === 'gun_no') {
+    G.sadness = Math.min(100, G.sadness + 24);
+    startDialogue([
+      { text: 'You put it down. You walk away.', speaker: '' },
+      { text: 'Something in you has already cracked.', speaker: '' },
+    ], () => fadeTo('ENDING'));
+  }
+}
+
+// ── Scene router ─────────────────────────────────────────────
+function startScene(name) {
+  DIAL.active   = false;
+  CHOICE.active = false;
+  switch (name) {
+    case 'TITLE':        initTitle();       break;
+    case 'ALLEY':        initAlley();       break;
+    case 'CITY1':        initCity1();       break;
+    case 'PHONE_OFFER':  initPhoneOffer();  break;
+    case 'PILLS_OFFER':  initPillsOffer();  break;
+    case 'SOCIAL_OFFER': initSocialOffer(); break;
+    case 'GUN_OFFER':    initGunOffer();    break;
+    case 'ENDING':       initEnding();      break;
+  }
+}
+
+// ============================================================
+//  DRAW HELPERS
+// ============================================================
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function rand(a, b)    { return a + Math.random() * (b - a); }
+function clamp(v,a,b)  { return v<a?a:v>b?b:v; }
+
+// ── Stickman figure (WBWTB style) ────────────────────────────
+function figure(x, y, opts = {}) {
+  const {
+    sz     = 1,
+    col    = '#1c1c1c',
+    eye    = 'dot',   // dot | sad | wide | x | spiral
+    anim   = 0,
+    glitch = 0,
+    lie    = false,
+    blood  = false,
+    al     = 1,
+    glow   = null,
+  } = opts;
+
+  ctx.save();
+  ctx.globalAlpha *= al;
+
+  let dx = 0, dy = 0;
+  if (glitch > 0) {
+    dx = (Math.random() - .5) * glitch;
+    dy = (Math.random() - .5) * glitch * .35;
+  }
+
+  if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = 20; }
+
+  const bob  = lie ? 0 : Math.sin(anim * 2.6) * 1.8 * sz;
+  const hs   = 19 * sz;
+  const lw   = 2.4 * sz;
+
+  ctx.strokeStyle = col;
+  ctx.lineWidth   = lw;
+  ctx.lineCap     = 'round';
+  ctx.lineJoin    = 'round';
+
+  if (!lie) {
+    const hx = x + dx, hy = y + dy;
+    const headY = hy - hs * 1.45 + bob;
+
+    // Square head
+    ctx.fillStyle = '#eeebe5';
+    ctx.strokeStyle = col;
+    ctx.fillRect  (hx - hs/2, headY, hs, hs);
+    ctx.strokeRect(hx - hs/2, headY, hs, hs);
+
+    // Eyes
+    const eyeY  = headY + hs * .44;
+    const eyeL  = hx - 5.5 * sz;
+    const eyeR  = hx + 5.5 * sz;
+
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = lw * .8;
+
+    if (eye === 'dot') {
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(eyeL, eyeY, 2.2*sz, 0, Math.PI*2);
+      ctx.arc(eyeR, eyeY, 2.2*sz, 0, Math.PI*2);
+      ctx.fill();
+    } else if (eye === 'sad') {
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(eyeL, eyeY + sz, 2*sz, 0, Math.PI*2);
+      ctx.arc(eyeR, eyeY + sz, 2*sz, 0, Math.PI*2);
+      ctx.fill();
+      // Frown
+      ctx.beginPath();
+      ctx.arc(hx, eyeY + 10*sz, 4.5*sz, .18*Math.PI, .82*Math.PI);
+      ctx.stroke();
+    } else if (eye === 'wide') {
+      ctx.beginPath();
+      ctx.arc(eyeL, eyeY, 3.8*sz, 0, Math.PI*2);
+      ctx.arc(eyeR, eyeY, 3.8*sz, 0, Math.PI*2);
+      ctx.stroke();
+      // O mouth
+      ctx.beginPath();
+      ctx.arc(hx, eyeY + 8*sz, 2.8*sz, 0, Math.PI*2);
+      ctx.stroke();
+    } else if (eye === 'x') {
+      [[eyeL, eyeY],[eyeR, eyeY]].forEach(([ex, ey]) => {
+        const s = 3.2 * sz;
+        ctx.beginPath();
+        ctx.moveTo(ex-s, ey-s); ctx.lineTo(ex+s, ey+s);
+        ctx.moveTo(ex+s, ey-s); ctx.lineTo(ex-s, ey+s);
+        ctx.stroke();
+      });
+    } else if (eye === 'spiral') {
+      [[eyeL, eyeY],[eyeR, eyeY]].forEach(([ex, ey]) => {
+        for (let i = 0; i < 8; i++) {
+          const a1 = i * .8, a2 = a1 + .7;
+          const r1 = i * .6, r2 = (i+1) * .6;
+          ctx.beginPath();
+          ctx.moveTo(ex + Math.cos(a1)*r1*sz, ey + Math.sin(a1)*r1*sz);
+          ctx.lineTo(ex + Math.cos(a2)*r2*sz, ey + Math.sin(a2)*r2*sz);
+          ctx.stroke();
+        }
+      });
+    }
+
+    ctx.lineWidth   = lw;
+    ctx.strokeStyle = col;
+
+    // Body
+    const bodyTop = headY + hs;
+    const bodyBot = bodyTop + 13 * sz;
+    ctx.beginPath();
+    ctx.moveTo(hx, bodyTop); ctx.lineTo(hx, bodyBot);
+    // Arms
+    ctx.moveTo(hx - 17*sz, bodyTop + 5*sz);
+    ctx.lineTo(hx + 17*sz, bodyTop + 5*sz);
+    // Legs
+    ctx.moveTo(hx, bodyBot); ctx.lineTo(hx - 11*sz, bodyBot + 22*sz);
+    ctx.moveTo(hx, bodyBot); ctx.lineTo(hx + 11*sz, bodyBot + 22*sz);
+    ctx.stroke();
+
+    // Blood splatter
+    if (blood) {
+      ctx.fillStyle = 'rgba(120,0,0,.8)';
+      [[hx-4, headY+6],[hx+8, bodyTop+4],[hx-2, bodyTop+12]].forEach(([bx, by]) => {
+        ctx.beginPath(); ctx.arc(bx, by, 2.8, 0, Math.PI*2); ctx.fill();
+      });
+      ctx.fillStyle = 'rgba(120,0,0,.6)';
+      ctx.fillRect(hx - 1, headY + 7, 2, 16);
+    }
+
+  } else {
+    // Dead / lying sideways
+    ctx.save();
+    ctx.translate(x + dx, y + dy);
+
+    ctx.fillStyle = '#eeebe5';
+    ctx.strokeStyle = col;
+    ctx.lineWidth   = lw;
+    ctx.fillRect  (-hs * .8, -hs/2, hs, hs);
+    ctx.strokeRect(-hs * .8, -hs/2, hs, hs);
+
+    // X eyes lying
+    ctx.lineWidth = lw * .75;
+    [[-5*sz, 0],[5*sz, 0]].forEach(([ex, ey]) => {
+      const s = 2.8*sz;
+      ctx.beginPath();
+      ctx.moveTo(ex-s, ey-s); ctx.lineTo(ex+s, ey+s);
+      ctx.moveTo(ex+s, ey-s); ctx.lineTo(ex-s, ey+s);
+      ctx.stroke();
+    });
+    ctx.lineWidth = lw;
+
+    // Body + limbs lying
+    const bx = hs * .22;
+    ctx.beginPath();
+    ctx.moveTo(bx, 0); ctx.lineTo(bx + 28*sz, 0);
+    ctx.moveTo(bx + 8*sz, 0); ctx.lineTo(bx + 8*sz, -14*sz);
+    ctx.moveTo(bx + 8*sz, 0); ctx.lineTo(bx + 16*sz,  13*sz);
+    ctx.moveTo(bx + 28*sz,0); ctx.lineTo(bx + 40*sz, -10*sz);
+    ctx.moveTo(bx + 28*sz,0); ctx.lineTo(bx + 42*sz,   6*sz);
+    ctx.stroke();
+
+    if (blood) {
+      ctx.fillStyle = 'rgba(115,0,0,.65)';
+      ctx.beginPath();
+      ctx.ellipse(bx + 14*sz, 9*sz, 14*sz, 7*sz, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+// ── City buildings ───────────────────────────────────────────
+function building(x, y, w, h, shade) {
+  shade = shade || '#2c2c2c';
+  ctx.fillStyle = shade;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, w, h);
+
+  const cols = Math.max(1, Math.floor((w - 10) / 22));
+  const rows = Math.max(1, Math.floor((h - 10) / 27));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const lit = Math.random() < .32;
+      ctx.fillStyle = lit ? 'rgba(255,225,145,.55)' : 'rgba(0,0,0,.45)';
+      ctx.fillRect(x + 6 + c*22, y + 7 + r*27, 12, 16);
+    }
+  }
+}
+
+// ── Sky ───────────────────────────────────────────────────────
+function drawSky(tint) {
+  const g = ctx.createLinearGradient(0, 0, 0, H * .57);
+  if (tint === 'red') {
+    g.addColorStop(0, '#2a1010');
+    g.addColorStop(1, '#6a3030');
+  } else {
+    g.addColorStop(0, '#323e4a');
+    g.addColorStop(1, '#74828f');
+  }
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H * .6);
+}
+
+// ── Ground ────────────────────────────────────────────────────
+function drawGround(y, col) {
+  col = col || '#a6a09a';
+  ctx.fillStyle = col;
+  ctx.fillRect(0, y, W, H - y);
+  ctx.strokeStyle = 'rgba(0,0,0,.1)'; ctx.lineWidth = 1;
+  for (let i = 0; i < 30; i++) {
+    const gx = (i * 91 + 17) % W;
+    const gy = y + ((i * 71 + 5) % (H - y - 8));
+    const gl = 8 + i % 15;
+    ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx + gl, gy); ctx.stroke();
+  }
+}
+
+// ── Dialogue box ─────────────────────────────────────────────
+function drawDialogueBox(text, speaker) {
+  if (!text) return;
+  const bx = 44, by = H - 142, bw = W - 134, bh = 110;
+
+  ctx.fillStyle = 'rgba(6,6,12,.92)';
+  ctx.strokeStyle = '#3a3a3a'; ctx.lineWidth = 1.5;
+  ctx.fillRect  (bx, by, bw, bh);
+  ctx.strokeRect(bx, by, bw, bh);
+
+  // WBWTB-style corner brackets
+  [[bx,by],[bx+bw,by],[bx,by+bh],[bx+bw,by+bh]].forEach(([cx,cy], i) => {
+    const sx = i%2===0 ? 1 : -1, sy = i<2 ? 1 : -1;
+    ctx.strokeStyle = '#555'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx + sx*12, cy);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx, cy + sy*12);
+    ctx.stroke();
+  });
+
+  if (speaker) {
+    ctx.fillStyle = '#666';
+    ctx.font = "bold 9px 'Courier New', monospace";
+    ctx.fillText(speaker.toUpperCase(), bx + 14, by - 4);
+  }
+
+  // Word-wrap text
+  ctx.fillStyle = '#eeebe5';
+  ctx.font = "14px 'Courier New', monospace";
+  const words  = text.split(' ');
+  const maxW   = bw - 32;
+  let line = '', lY = by + 30;
+  words.forEach((w, i) => {
+    const test = line + w + ' ';
+    if (ctx.measureText(test).width > maxW && i > 0) {
+      ctx.fillText(line, bx + 14, lY);
+      line = w + ' '; lY += 23;
+    } else line = test;
+  });
+  ctx.fillText(line, bx + 14, lY);
+
+  // Blink "click to continue"
+  if (DIAL.done && !CHOICE.active) {
+    if (Math.sin(G.time * 6) > 0) {
+      ctx.fillStyle = '#444';
+      ctx.font = "10px 'Courier New', monospace";
+      ctx.textAlign = 'right';
+      ctx.fillText('[ CLICK ]', bx + bw - 10, by + bh - 9);
+      ctx.textAlign = 'left';
+    }
+  }
+}
+
+// ── Choice buttons ───────────────────────────────────────────
+function drawChoices() {
+  if (!CHOICE.active) return;
+  const bw    = 310, bh = 56;
+  const total = CHOICE.options.length;
+  const gap   = 24;
+  const startX = W/2 - (total * bw + (total-1)*gap) / 2;
+
+  CHOICE.options.forEach((opt, i) => {
+    const bx = startX + i*(bw+gap), by = H * .762;
+    opt._x = bx; opt._y = by; opt._w = bw; opt._h = bh;
+
+    const hov = MOUSE.x >= bx && MOUSE.x <= bx+bw &&
+                MOUSE.y >= by && MOUSE.y <= by+bh;
+    if (hov) canvas.style.cursor = 'pointer';
+
+    ctx.shadowColor = hov ? 'rgba(255,255,255,.3)' : 'transparent';
+    ctx.shadowBlur  = hov ? 16 : 0;
+
+    ctx.fillStyle   = hov ? '#eeebe5' : 'rgba(10,10,16,.93)';
+    ctx.strokeStyle = hov ? '#eeebe5' : '#484848';
+    ctx.lineWidth   = 1.8;
+    ctx.fillRect  (bx, by, bw, bh);
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle  = hov ? '#0a0a0a' : '#e8e5e0';
+    ctx.font       = "bold 12px 'Courier New', monospace";
+    ctx.textAlign  = 'center';
+    ctx.fillText(opt.label, bx + bw/2, by + bh/2 + 5);
+    ctx.textAlign  = 'left';
+  });
+}
+
+// ── HUD ───────────────────────────────────────────────────────
+function drawHUD() {
+  const bx = W - 38, by = 52, bh = H - 112;
+
+  // Bar background
+  ctx.fillStyle = 'rgba(0,0,0,.52)';
+  ctx.fillRect(bx - 5, by - 5, 28, bh + 10);
+  ctx.strokeStyle = '#282828'; ctx.lineWidth = 1;
+  ctx.strokeRect(bx - 5, by - 5, 28, bh + 10);
+
+  // Sadness fill
+  const fillH = (G.sadness / 100) * bh;
+  const fc = G.sadness > 70 ? '#7a0000'
+           : G.sadness > 45 ? '#3d2020'
+           : '#2a2a2a';
+  ctx.fillStyle = fc;
+  ctx.fillRect(bx, by + bh - fillH, 18, fillH);
+
+  // Tick marks
+  ctx.strokeStyle = '#2a2a2a'; ctx.lineWidth = 1;
+  for (let t = 0; t <= 5; t++) {
+    const ty = by + (1 - t/5) * bh;
+    ctx.beginPath(); ctx.moveTo(bx - 5, ty); ctx.lineTo(bx, ty); ctx.stroke();
+  }
+
+  // Label rotated
+  ctx.save();
+  ctx.translate(bx + 9, by + bh/2); ctx.rotate(-Math.PI/2);
+  ctx.fillStyle = '#333'; ctx.font = "9px 'Courier New', monospace";
+  ctx.textAlign = 'center'; ctx.fillText('SADNESS', 0, 0);
+  ctx.restore();
+
+  // Money
+  if (G.money > 0) {
+    ctx.fillStyle = '#666'; ctx.font = "bold 13px 'Courier New', monospace";
+    ctx.textAlign = 'right';
+    ctx.fillText('$' + G.money, W - 52, 34);
+    ctx.textAlign = 'left';
+  }
+
+  // Glitch scan-lines at high sadness
+  if (G.sadness > 60 && Math.random() < .06) {
+    try {
+      const gy = (Math.random() * H) | 0;
+      const gh = 2 + (Math.random() * 8 | 0);
+      const img = ctx.getImageData(0, gy, W, gh);
+      const offset = (-28 + Math.random() * 56) | 0;
+      const tmp = document.createElement('canvas');
+      tmp.width = W; tmp.height = gh;
+      tmp.getContext('2d').putImageData(img, 0, 0);
+      ctx.drawImage(tmp, offset, gy);
+    } catch(e) {}
+  }
+}
+
+// ── Film grain ────────────────────────────────────────────────
+function drawGrain() {
+  ctx.globalAlpha = .065;
+  ctx.drawImage(noiseCanvases[Math.floor(noiseFrame) % NOISE_COUNT], 0, 0);
+  ctx.globalAlpha = 1;
+  noiseFrame += .28;
+}
+
+// ── Background NPC helpers ────────────────────────────────────
+function spawnBgNPCs(count) {
+  bgNPCs = [];
+  for (let i = 0; i < count; i++) {
+    bgNPCs.push({
+      x  : 60 + Math.random() * (W - 160),
+      y  : H * .56 + Math.random() * (H * .16),
+      vx : (Math.random() - .5) * 20,
+      vy : (Math.random() - .5) * 5,
+      an : Math.random() * 7,
+      sz : .65 + Math.random() * .4,
+      al : .4 + Math.random() * .5
+    });
+  }
+}
+
+function updateBgNPCs(dt) {
+  bgNPCs.forEach(n => {
+    n.x += n.vx * dt; n.y += n.vy * dt; n.an += dt;
+    if (n.x < 40)    n.vx =  Math.abs(n.vx);
+    if (n.x > W-80)  n.vx = -Math.abs(n.vx);
+    if (n.y < H*.54) n.vy =  Math.abs(n.vy);
+    if (n.y > H-50)  n.vy = -Math.abs(n.vy);
+  });
+}
+
+// ============================================================
+//  SCENES
+// ============================================================
+
+// ── TITLE ────────────────────────────────────────────────────
+function initTitle() {
+  G.state = 'TITLE';
+  scene   = { pulse: 0 };
+  spawnBgNPCs(14);
+}
+
+function updateTitle(dt) {
+  scene.pulse += dt;
+  updateBgNPCs(dt);
+}
+
+function drawTitle() {
+  // Flat grey world
+  ctx.fillStyle = '#b0a9a0';
+  ctx.fillRect(0, 0, W, H);
+  // Ground marks
+  ctx.strokeStyle = 'rgba(0,0,0,.08)'; ctx.lineWidth = 1;
+  for (let i = 0; i < 44; i++) {
+    const gx = (i*89+11) % W, gy = H*.22 + ((i*131)%(H*.74));
+    ctx.beginPath(); ctx.moveTo(gx,gy); ctx.lineTo(gx+7+(i*7)%16, gy); ctx.stroke();
+  }
+
+  bgNPCs.forEach(n => figure(n.x, n.y, { sz:n.sz, anim:n.an, al:n.al }));
+
+  // Giant TV (like WBWTB)
+  const tvX = W*.48, tvY = H*.36, tvW = 148, tvH = 100;
+  ctx.fillStyle = '#1c1c1c'; ctx.strokeStyle = '#0a0a0a'; ctx.lineWidth = 3;
+  ctx.fillRect(tvX - tvW/2, tvY - tvH/2, tvW, tvH);
+  ctx.strokeRect(tvX - tvW/2, tvY - tvH/2, tvW, tvH);
+  // Screen glow
+  ctx.fillStyle = 'rgba(220,215,205,.07)';
+  ctx.fillRect(tvX - tvW/2 + 8, tvY - tvH/2 + 8, tvW - 16, tvH - 16);
+  // Stand
+  ctx.strokeStyle = '#0a0a0a'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(tvX, tvY+tvH/2); ctx.lineTo(tvX, tvY+tvH/2+22); ctx.stroke();
+  ctx.fillRect(tvX - 18, tvY+tvH/2+18, 36, 7);
+
+  // Title text inside TV-like screen
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(tvX - tvW/2 + 8, tvY - tvH/2 + 8, tvW - 16, tvH - 16);
+  ctx.clip();
+  ctx.fillStyle = '#1a1a22'; ctx.fillRect(tvX-tvW/2, tvY-tvH/2, tvW, tvH);
+  ctx.fillStyle = 'rgba(200,195,185,.88)';
+  ctx.font = "bold 9px 'Courier New', monospace";
+  ctx.textAlign = 'center';
+  ctx.fillText('YOU ARE WHAT', tvX, tvY - 6);
+  ctx.fillText('YOU USE', tvX, tvY + 10);
+  ctx.restore();
+
+  // Big title outside
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(0,0,0,.18)';
+  ctx.font = "bold 48px 'Courier New', monospace";
+  ctx.fillText('YOU ARE WHAT YOU USE', W/2 + 2, H*.14 + 2);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillText('YOU ARE WHAT YOU USE', W/2, H*.14);
+
+  ctx.fillStyle = '#3a3535';
+  ctx.font = "13px 'Courier New', monospace";
+  ctx.fillText('a game about easy choices and hard consequences', W/2, H*.14 + 36);
+
+  if (Math.sin(scene.pulse * 3.8) > 0) {
+    ctx.fillStyle = '#1e1e1e';
+    ctx.font = "bold 16px 'Courier New', monospace";
+    ctx.fillText('[ CLICK ANYWHERE TO BEGIN ]', W/2, H*.14 + 70);
+  }
+  ctx.textAlign = 'left';
+}
+
+// ── ALLEY ─────────────────────────────────────────────────────
+function initAlley() {
+  G.state = 'ALLEY';
+  scene = {
+    phase       : 'walk',
+    playerX     : W + 90,
+    playerTarget: W * .4,
+    figAlpha    : 0,
+    figGlitch   : 0,
+    knifeAlpha  : 0,
+    knifeGone   : false,
+    dyingTimer  : 0,
+    figureDead  : false,
+    introStarted: false,
+    dyingStarted: false,
+  };
+}
+
+function updateAlley(dt) {
+  const s = scene;
+
+  if (s.phase === 'walk') {
+    s.playerX = lerp(s.playerX, s.playerTarget, dt * 1.7);
+    if (s.playerX < s.playerTarget + 14) s.phase = 'appear';
+  }
+
+  if (s.phase === 'appear') {
+    s.figAlpha  = Math.min(s.figAlpha  + dt * .7, 1);
+    s.figGlitch = lerp(s.figGlitch, 11, dt * 2.8);
+    if (s.figAlpha > .8 && !s.introStarted) {
+      s.introStarted = true;
+      startDialogue([
+        { text: '...', speaker: '???' },
+        { text: 'You shouldn\'t be in this alley.', speaker: '???' },
+        { text: 'But you are.', speaker: '???' },
+        { text: 'Take this.', speaker: '???' },
+        { text: 'This will make your life easier.', speaker: '???' },
+      ], () => { s.phase = 'knife_offered'; });
+    }
+  }
+
+  if (s.phase === 'knife_offered') {
+    s.knifeAlpha = Math.min(s.knifeAlpha + dt * 2.8, 1);
+  }
+
+  if (s.phase === 'dying') {
+    s.dyingTimer += dt;
+    s.figureDead  = true;
+    s.figGlitch   = lerp(s.figGlitch, 0, dt * 6);
+    if (s.dyingTimer > 1.8 && !s.dyingStarted) {
+      s.dyingStarted = true;
+      startDialogue([
+        { text: 'He collapses. You don\'t know what just happened.', speaker: '' },
+        { text: 'The knife is in your hand now.', speaker: '' },
+        { text: 'It feels heavier than it looks.', speaker: '' },
+        { text: 'You step back into the light.', speaker: '' },
+      ], () => fadeTo('CITY1'));
+    }
+  }
+
+  updateDialogue(dt);
+}
+
+function drawAlley() {
+  const s = scene;
+  ctx.fillStyle = '#12121a'; ctx.fillRect(0, 0, W, H);
+
+  // Perspective alley walls
+  ctx.fillStyle = '#1e1e24';
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W*.33,H*.26); ctx.lineTo(W*.33,H); ctx.lineTo(0,H); ctx.fill();
+  ctx.fillStyle = '#191922';
+  ctx.beginPath(); ctx.moveTo(W,0); ctx.lineTo(W*.67,H*.26); ctx.lineTo(W*.67,H); ctx.lineTo(W,H); ctx.fill();
+  // Floor
+  ctx.fillStyle = '#22201a';
+  ctx.fillRect(W*.33, H*.26, W*.34, H*.74);
+
+  // Brick texture
+  ctx.strokeStyle = 'rgba(0,0,0,.12)'; ctx.lineWidth = 1;
+  for (let r = 0; r < 14; r++) for (let c = 0; c < 5; c++) {
+    ctx.strokeRect(3  + c*50, 12 + r*30, 47, 27);
+    ctx.strokeRect(W - 52 - c*50, 12 + r*30, 47, 27);
+  }
+
+  // End-of-alley ambient glow
+  const eg = ctx.createRadialGradient(W/2, H*.26, 0, W/2, H*.26, 100);
+  eg.addColorStop(0, 'rgba(180,165,140,.14)');
+  eg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = eg; ctx.fillRect(0, 0, W, H);
+
+  // Puddle
+  ctx.fillStyle = 'rgba(0,0,0,.2)';
+  ctx.beginPath(); ctx.ellipse(W*.47, H*.78, 42, 11, 0, 0, Math.PI*2); ctx.fill();
+
+  // Player
+  figure(s.playerX, H * .7, { sz: 1.1, anim: G.time, eye: 'dot' });
+
+  // Glitchy bloody stranger
+  if (s.figAlpha > 0 && !s.figureDead) {
+    ctx.save(); ctx.globalAlpha = s.figAlpha;
+
+    if (s.figGlitch > 2) {
+      ctx.shadowColor = '#600'; ctx.shadowBlur = 18;
+      if (Math.random() < .32) {
+        ctx.fillStyle = `rgba(180,0,0,${.03 + Math.random()*.1})`;
+        ctx.fillRect(W*.44 - 60, (H*.5 + Math.random()*80)|0, 140, (2 + Math.random()*10)|0);
+      }
+    }
+
+    figure(W * .62, H * .63, {
+      sz    : 1.0,
+      col   : '#3a0000',
+      eye   : Math.random() < .07 ? 'x' : 'wide',
+      glitch: s.figGlitch,
+      blood : true,
+      anim  : G.time * 1.6
+    });
+    ctx.restore();
+  }
+
+  // Dead stranger
+  if (s.figureDead) {
+    const fa = Math.max(0, 1 - s.dyingTimer * 1.3);
+    ctx.save(); ctx.globalAlpha = fa;
+    figure(W * .64, H * .64, { sz: 1.0, col: '#3a0000', lie: true, blood: true });
+    ctx.restore();
+  }
+
+  // Knife on ground
+  if ((s.phase === 'knife_offered' || s.phase === 'dying') && !s.knifeGone) {
+    const kx = W * .42, ky = H * .56;
+    ctx.save(); ctx.globalAlpha = s.knifeAlpha;
+
+    const kg = ctx.createRadialGradient(kx, ky, 0, kx, ky, 38);
+    kg.addColorStop(0, 'rgba(160,180,255,.25)');
+    kg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = kg; ctx.beginPath(); ctx.arc(kx, ky, 38, 0, Math.PI*2); ctx.fill();
+
+    const hov = Math.hypot(MOUSE.x - kx, MOUSE.y - ky) < 34;
+    if (hov) canvas.style.cursor = 'pointer';
+
+    ctx.save();
+    ctx.translate(kx, ky);
+    ctx.rotate(-Math.PI/4 + Math.sin(G.time * 2) * .06);
+    // Blade
+    ctx.fillStyle = hov ? '#dde4ee' : '#a0a8b4';
+    ctx.beginPath(); ctx.moveTo(0,-26); ctx.lineTo(4,18); ctx.lineTo(-4,18); ctx.closePath(); ctx.fill();
+    // Guard
+    ctx.fillStyle = '#665542';
+    ctx.fillRect(-7, 14, 14, 5);
+    // Handle
+    ctx.fillStyle = '#3a2810';
+    ctx.fillRect(-4, 19, 8, 18);
+    ctx.restore();
+
+    if (hov) {
+      ctx.fillStyle = '#c8c4be'; ctx.font = "10px 'Courier New', monospace";
+      ctx.textAlign = 'center'; ctx.fillText('[pick up]', kx, ky - 44);
+      ctx.textAlign = 'left';
+    }
+    ctx.restore();
+  }
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+}
+
+// ── CITY 1 (man with wallet) ──────────────────────────────────
+function initCity1() {
+  G.state = 'CITY1';
+  scene   = { playerX: -80, started: false, targetNpcWalk: true, npcX: W*.72 };
+  spawnBgNPCs(9);
+}
+
+function updateCity1(dt) {
+  scene.playerX = lerp(scene.playerX, W * .30, dt * 1.8);
+  if (scene.npcX > W * .65) scene.npcX -= 28 * dt;
+  updateBgNPCs(dt);
+  if (scene.playerX > W * .24 && !scene.started) {
+    scene.started = true;
+    startDialogue([
+      { text: 'I\'m nearly out of money.', speaker: 'YOU' },
+      { text: 'That man has a wallet. I can see it.', speaker: 'YOU' },
+      { text: 'The knife in your pocket is right there.', speaker: '' },
+      { text: 'It would be so easy.', speaker: '' },
+    ], () => {
+      CHOICE.active = true;
+      CHOICE.options = [
+        { label: 'USE THE KNIFE  [ +$22 ]', action: 'knife_yes' },
+        { label: 'WALK AWAY',               action: 'knife_no'  },
+      ];
+    });
+  }
+  updateDialogue(dt);
+}
+
+function drawCity1() {
+  drawSky();
+  [
+    {x:0,   y:H*.10,w:108,h:H*.45},
+    {x:102, y:H*.17,w:84, h:H*.38},
+    {x:182, y:H*.08,w:130,h:H*.47},
+    {x:398, y:H*.12,w:100,h:H*.43},
+    {x:554, y:H*.06,w:140,h:H*.49},
+    {x:698, y:H*.13,w:110,h:H*.42},
+    {x:820, y:H*.09,w:140,h:H*.46},
+  ].forEach(b => building(b.x, b.y, b.w, b.h));
+  drawGround(H * .557);
+
+  bgNPCs.forEach(n => figure(n.x, n.y, { sz:n.sz, anim:n.an, al:n.al }));
+
+  // Target NPC with wallet visible
+  figure(scene.npcX, H * .66, { sz: 1.12, anim: G.time * .5, eye: 'dot' });
+  // Wallet indicator
+  if (scene.started) {
+    ctx.fillStyle = 'rgba(255,220,100,.7)'; ctx.font = "10px 'Courier New', monospace";
+    ctx.textAlign = 'center';
+    if (Math.sin(G.time*5) > 0) ctx.fillText('▼', scene.npcX, H*.66 - 68);
+    ctx.textAlign = 'left';
+  }
+
+  figure(scene.playerX, H * .68, { sz: 1.1, anim: G.time, eye: G.sadness>30?'sad':'dot' });
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+  if (CHOICE.active) drawChoices();
+}
+
+// ── PHONE OFFER ───────────────────────────────────────────────
+function initPhoneOffer() {
+  G.state  = 'PHONE_OFFER';
+  scene    = { strangerX: W + 80, started: false, an: 0, phoneShown: false };
+  spawnBgNPCs(7);
+}
+
+function updatePhoneOffer(dt) {
+  scene.an += dt;
+  scene.strangerX = lerp(scene.strangerX, W * .65, dt * 1.4);
+  updateBgNPCs(dt);
+  if (scene.strangerX < W * .7 && !scene.started) {
+    scene.started = true;
+    startDialogue([
+      { text: 'Hey. Wait.', speaker: 'STRANGER' },
+      { text: 'Here. Take this.', speaker: 'STRANGER' },
+      { text: 'This will make your life easier.', speaker: 'STRANGER' },
+      { text: 'It\'s connected to everything. Everyone\'s location. Their messages. Their life.', speaker: '' },
+      { text: 'All you have to do is use it.', speaker: '' },
+    ], () => {
+      scene.phoneShown = true;
+      CHOICE.active  = true;
+      CHOICE.options = [
+        { label: 'USE IT  [ track someone ]', action: 'phone_yes' },
+        { label: 'LEAVE IT BEHIND',           action: 'phone_no'  },
+      ];
+    });
+  }
+  updateDialogue(dt);
+}
+
+function drawPhoneOffer() {
+  drawSky();
+  [{x:0,y:H*.1,w:105,h:H*.46},{x:200,y:H*.07,w:128,h:H*.47},
+   {x:558,y:H*.06,w:138,h:H*.49},{x:802,y:H*.09,w:156,h:H*.46}]
+  .forEach(b => building(b.x, b.y, b.w, b.h));
+  drawGround(H * .557);
+  bgNPCs.forEach(n => figure(n.x, n.y, { sz:n.sz, anim:n.an, al:n.al }));
+
+  // Player
+  figure(W * .32, H * .68, { sz: 1.1, anim: scene.an, eye: G.sadness>40?'sad':'dot' });
+
+  // Stranger with blue glow
+  ctx.save(); ctx.shadowColor='#3a70d0'; ctx.shadowBlur = 24;
+  figure(scene.strangerX, H * .68, { sz: 1.05, anim: -scene.an*.7, eye: 'dot' });
+  ctx.restore();
+
+  // Phone in stranger's hand
+  if (scene.started || scene.phoneShown) {
+    const px = scene.strangerX - 26, py = H * .63;
+    const pg = ctx.createRadialGradient(px, py, 0, px, py, 32);
+    pg.addColorStop(0, 'rgba(55,105,200,.42)');
+    pg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = pg; ctx.beginPath(); ctx.arc(px, py, 32, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#0d0d1e'; ctx.strokeStyle = '#344c8a'; ctx.lineWidth = 2;
+    ctx.fillRect(px-9,py-17,18,30); ctx.strokeRect(px-9,py-17,18,30);
+    ctx.fillStyle = `rgba(44,80,188,${.5 + Math.sin(G.time*3)*.18})`;
+    ctx.fillRect(px-6,py-14,12,22);
+  }
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+  if (CHOICE.active) drawChoices();
+}
+
+// ── PILLS OFFER ───────────────────────────────────────────────
+function initPillsOffer() {
+  G.state = 'PILLS_OFFER';
+  scene   = { started: false, an: 0 };
+}
+
+function updatePillsOffer(dt) {
+  scene.an += dt;
+  if (!scene.started) {
+    scene.started = true;
+    startDialogue([
+      { text: 'A man in a white coat approaches.', speaker: '' },
+      { text: 'I can see it on your face. You\'re not doing well.', speaker: 'DOCTOR' },
+      { text: 'Here. These will make your life easier.', speaker: 'DOCTOR' },
+      { text: 'One a day. You\'ll feel nothing. No sadness. No guilt. No anything.', speaker: 'DOCTOR' },
+    ], () => {
+      CHOICE.active  = true;
+      CHOICE.options = [
+        { label: 'TAKE THE PILLS  [ -sadness ]', action: 'pills_yes' },
+        { label: 'REFUSE',                       action: 'pills_no'  },
+      ];
+    });
+  }
+  updateDialogue(dt);
+}
+
+function drawPillsOffer() {
+  // Office interior
+  ctx.fillStyle = '#c0bab4'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#cdc8c2'; ctx.fillRect(88,66,W-176,H-96);
+  ctx.strokeStyle = '#aaa8a4'; ctx.lineWidth = 1.5; ctx.strokeRect(88,66,W-176,H-96);
+  // Floor
+  ctx.fillStyle = '#b4b0aa';
+  ctx.fillRect(88, H*.62, W-176, H*.28);
+  ctx.strokeStyle = '#a8a4a0'; ctx.lineWidth = 1;
+  // Windows
+  ctx.strokeRect(136,86,190,144); ctx.strokeRect(W-328,86,190,144);
+  ctx.fillStyle='rgba(160,190,220,.12)'; ctx.fillRect(136,86,190,144); ctx.fillRect(W-328,86,190,144);
+
+  // Doctor (white coat tint)
+  figure(W * .65, H * .65, { sz: 1.08, anim: scene.an * .4, eye: 'dot', col: '#1c1c2a' });
+
+  // Pills on desk
+  const dpx = W*.65 - 30, dpy = H*.63;
+  [[0,0],[9,-5],[5,7],[18,-2]].forEach(([ox,oy]) => {
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(dpx+ox, dpy+oy, 6, 3.5, .3, 0, Math.PI*2);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#e8c8c8';
+    ctx.beginPath(); ctx.ellipse(dpx+ox, dpy+oy, 6, 3.5, .3, 0, Math.PI);
+    ctx.fill();
+  });
+
+  // Player (sad if sadness high)
+  figure(W * .32, H * .65, {
+    sz: 1.1, anim: scene.an,
+    eye: G.sadness > 45 ? 'sad' : 'dot'
+  });
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+  if (CHOICE.active) drawChoices();
+}
+
+// ── SOCIAL OFFER ──────────────────────────────────────────────
+function initSocialOffer() {
+  G.state = 'SOCIAL_OFFER';
+  scene   = { started: false, an: 0, orbitA: 0 };
+}
+
+function updateSocialOffer(dt) {
+  scene.an     += dt;
+  scene.orbitA += dt * .35;
+  if (!scene.started) {
+    scene.started = true;
+    startDialogue([
+      { text: 'Your phone buzzes.', speaker: '' },
+      { text: 'CONNECT. SHARE. BE SEEN.', speaker: 'NOTIFICATION' },
+      { text: 'This will make your life easier.', speaker: 'NOTIFICATION' },
+      { text: 'Post everything. Let the numbers tell you who you are.', speaker: '' },
+    ], () => {
+      CHOICE.active  = true;
+      CHOICE.options = [
+        { label: 'POST EVERYTHING', action: 'social_yes' },
+        { label: 'STAY PRIVATE',    action: 'social_no'  },
+      ];
+    });
+  }
+  updateDialogue(dt);
+}
+
+function drawSocialOffer() {
+  ctx.fillStyle = '#08080f'; ctx.fillRect(0,0,W,H);
+
+  // Blue haze
+  const sg = ctx.createRadialGradient(W/2, H*.42, 0, W/2, H*.42, 280);
+  sg.addColorStop(0, `rgba(44,88,200,${.24 + Math.sin(G.time*1.8)*.06})`);
+  sg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sg; ctx.fillRect(0,0,W,H);
+
+  // Big phone in center
+  const phX = W/2, phY = H*.38, phW = 122, phH = 202;
+  ctx.fillStyle = '#080814'; ctx.strokeStyle = '#1e3870'; ctx.lineWidth = 3;
+  ctx.fillRect  (phX-phW/2, phY-phH/2, phW, phH);
+  ctx.strokeRect(phX-phW/2, phY-phH/2, phW, phH);
+  ctx.fillStyle = `rgba(18,38,90,${.4+Math.sin(G.time*2.8)*.12})`;
+  ctx.fillRect  (phX-phW/2+8, phY-phH/2+14, phW-16, phH-28);
+
+  // Like counters scrolling
+  ctx.fillStyle = '#3a6cc8'; ctx.font = "8px 'Courier New', monospace"; ctx.textAlign = 'center';
+  const counts = ['♥ 1,204','♥ 847','♥ 3,901','♥ 12,544','♥ 288'];
+  counts.forEach((t,i) => ctx.fillText(t, phX, phY - 58 + i*32));
+  ctx.textAlign = 'left';
+
+  // Orbiting notification dots
+  for (let i = 0; i < 7; i++) {
+    const a = scene.orbitA + i * Math.PI * 2/7;
+    const r = 150;
+    const alpha = .1 + Math.sin(G.time*2 + i)*.08;
+    ctx.fillStyle = `rgba(62,108,212,${alpha})`;
+    ctx.beginPath();
+    ctx.arc(phX + Math.cos(a)*r, phY + Math.sin(a)*r*.48, 8, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  figure(W/2, H*.8, {
+    sz  : 1.1,
+    anim: scene.an,
+    eye : G.sadness > 55 ? 'sad' : 'dot',
+    col : '#202840'
+  });
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+  if (CHOICE.active) drawChoices();
+}
+
+// ── GUN OFFER ─────────────────────────────────────────────────
+function initGunOffer() {
+  G.state = 'GUN_OFFER';
+  scene   = { started: false, an: 0, flash: 0 };
+  spawnBgNPCs(5);
+}
+
+function updateGunOffer(dt) {
+  scene.an += dt;
+  if (scene.flash > 0) scene.flash -= dt * 4;
+  updateBgNPCs(dt);
+  if (!scene.started) {
+    scene.started = true;
+    startDialogue([
+      { text: 'Someone leaves a box on the bench beside you.', speaker: '' },
+      { text: 'They don\'t look back.', speaker: '' },
+      { text: 'Inside: a gun.', speaker: '' },
+      { text: 'A note reads: This will make your life easier.', speaker: '' },
+      { text: 'The man across the street is carrying a briefcase full of cash. You somehow know this.', speaker: '' },
+    ], () => {
+      CHOICE.active  = true;
+      CHOICE.options = [
+        { label: 'PULL THE TRIGGER  [ +$60 ]', action: 'gun_yes' },
+        { label: 'WALK AWAY',                  action: 'gun_no'  },
+      ];
+    });
+  }
+  updateDialogue(dt);
+}
+
+function drawGunOffer() {
+  drawSky(G.sadness > 55 ? 'red' : null);
+  [
+    {x:0,   y:H*.10,w:108,h:H*.45},
+    {x:190, y:H*.08,w:128,h:H*.47},
+    {x:556, y:H*.06,w:138,h:H*.49},
+    {x:804, y:H*.09,w:154,h:H*.46},
+  ].forEach(b => building(b.x, b.y, b.w, b.h, G.sadness>55?'#2a1a1a':'#2c2c2c'));
+  drawGround(H * .557, G.sadness>55?'#9a9098':'#a6a09a');
+  bgNPCs.forEach(n => figure(n.x, n.y, { sz:n.sz, anim:n.an, al:n.al*.7 }));
+
+  // Target NPC
+  figure(W * .67, H * .66, { sz: 1.12, anim: G.time * .4, eye: 'dot' });
+
+  // Bench
+  ctx.fillStyle = '#3a3028'; ctx.fillRect(W*.32, H*.71, 68, 10);
+  ctx.fillRect(W*.34, H*.721, 8, 16); ctx.fillRect(W*.38+32, H*.721, 8, 16);
+
+  // Gun on bench
+  const gx = W*.37, gy = H*.70;
+  const gg = ctx.createRadialGradient(gx, gy, 0, gx, gy, 28);
+  gg.addColorStop(0, `rgba(${G.sadness>55?'200,60,60':'120,120,180'},.28)`);
+  gg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(gx, gy, 28, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#2a2828'; ctx.strokeStyle = '#555'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(gx-18, gy); ctx.lineTo(gx+14, gy); ctx.lineTo(gx+14, gy-8);
+  ctx.lineTo(gx+18, gy-8); ctx.lineTo(gx-12, gy-8); ctx.lineTo(gx-18, gy);
+  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(gx-2, gy); ctx.lineTo(gx-2, gy+12); ctx.lineTo(gx+8, gy+12); ctx.lineTo(gx+8, gy);
+  ctx.fillStyle = '#222'; ctx.fill(); ctx.stroke();
+
+  // Player
+  figure(W * .32, H * .67, {
+    sz  : 1.1,
+    anim: scene.an,
+    eye : G.sadness > 65 ? 'wide' : G.sadness > 40 ? 'sad' : 'dot'
+  });
+
+  // Flash on gun_yes
+  if (scene.flash > 0) {
+    ctx.fillStyle = `rgba(255,240,200,${scene.flash * .6})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  if (DIAL.active) {
+    const t = DIAL.lines[DIAL.index].text.slice(0, DIAL.charI);
+    drawDialogueBox(t, DIAL.lines[DIAL.index].speaker);
+  }
+  if (CHOICE.active) drawChoices();
+}
+
+// ── ENDING ─────────────────────────────────────────────────────
+function initEnding() {
+  G.state = 'ENDING';
+  scene   = { an: 0, textAlpha: 0, glitchMult: 0 };
+}
+
+function updateEnding(dt) {
+  scene.an        += dt;
+  scene.textAlpha  = Math.min(scene.textAlpha + dt * .35, 1);
+  if (G.sadness >= 65) scene.glitchMult = Math.min(scene.glitchMult + dt * .8, 1);
+}
+
+function drawEnding() {
+  const bad = G.sadness >= 65;
+
+  if (bad) {
+    // Dark collapse ending
+    ctx.fillStyle = '#060005'; ctx.fillRect(0,0,W,H);
+
+    // Red scan-line glitch
+    for (let i = 0; i < 6; i++) {
+      if (Math.random() < .25) {
+        ctx.fillStyle = `rgba(140,0,0,${.04 + Math.random()*.12})`;
+        ctx.fillRect(0, (Math.random()*H)|0, W, (1 + Math.random()*9)|0);
+      }
+    }
+
+    // Many fractured figures
+    for (let i = 0; i < 9; i++) {
+      const ox = (Math.random()-.5)*100, oy = (Math.random()-.5)*50;
+      figure(W/2 + ox, H*.48 + oy, {
+        sz    : .4 + Math.random() * 1.0,
+        col   : `rgba(${80+Math.random()*80},0,0,1)`,
+        eye   : ['x','spiral','wide'][Math.floor(Math.random()*3)],
+        glitch: 12 * Math.random(),
+        al    : .12 + Math.random() * .6,
+        anim  : scene.an * (1 + Math.random())
+      });
+    }
+
+    // Central dead figure
+    figure(W/2, H*.52, {
+      sz  : 1.25,
+      col : '#1a0000',
+      lie : true,
+      blood: true,
+      glow: 'rgba(120,0,0,.5)'
+    });
+
+    // Text
+    ctx.save(); ctx.globalAlpha = scene.textAlpha;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#3a0000'; ctx.font = "bold 34px 'Courier New', monospace";
+    ctx.fillText('YOU BECAME WHAT YOU USED', W/2, H*.17);
+    ctx.fillStyle = '#1a0000'; ctx.font = "13px 'Courier New', monospace";
+    ctx.fillText('the tools shaped you more than you shaped them', W/2, H*.17 + 36);
+
+    // Stats
+    ctx.fillStyle = '#280000'; ctx.font = "12px 'Courier New', monospace";
+    ctx.fillText(`sadness: ${G.sadness}%   kills: ${G.kills}   money: $${G.money}`, W/2, H*.88);
+    ctx.restore();
+
+  } else {
+    // Grey numb ending
+    ctx.fillStyle = '#a8a2a0'; ctx.fillRect(0,0,W,H);
+
+    for (let i = 0; i < 40; i++) {
+      const gx = (i*89+11)%W, gy = H*.22 + ((i*131)%(H*.74));
+      ctx.strokeStyle = 'rgba(0,0,0,.07)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(gx,gy); ctx.lineTo(gx+6+(i*7)%14,gy); ctx.stroke();
+    }
+
+    figure(W/2, H*.54, {
+      sz: 1.2, anim: scene.an * .15,
+      eye: G.sadness > 35 ? 'sad' : 'dot',
+      al: .72
+    });
+
+    ctx.save(); ctx.globalAlpha = scene.textAlpha;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#1e1e1e'; ctx.font = "bold 30px 'Courier New', monospace";
+    ctx.fillText('YOU SURVIVED', W/2, H*.13);
+    ctx.fillStyle = '#3a3a3a'; ctx.font = "13px 'Courier New', monospace";
+    ctx.fillText('but something is missing', W/2, H*.13 + 34);
+    ctx.fillText('you just don\'t know what yet', W/2, H*.13 + 56);
+
+    ctx.fillStyle = '#555'; ctx.font = "12px 'Courier New', monospace";
+    ctx.fillText(`sadness: ${G.sadness}%   kills: ${G.kills}   money: $${G.money}`, W/2, H*.88);
+    ctx.restore();
+  }
+
+  // Restart prompt
+  if (scene.textAlpha > .85 && Math.sin(G.time * 3.2) > 0) {
+    ctx.fillStyle = bad ? 'rgba(100,0,0,.6)' : 'rgba(60,60,60,.6)';
+    ctx.font = "bold 13px 'Courier New', monospace";
+    ctx.textAlign = 'center';
+    ctx.fillText('[ CLICK TO PLAY AGAIN ]', W/2, H*.95);
+    ctx.textAlign = 'left';
+  }
+}
+
+// Ending click-to-restart
+canvas.addEventListener('click', () => {
+  if (G.state === 'ENDING' && scene.textAlpha > .85 && !TRANS.fadingOut) {
+    G.sadness = 0; G.money = 0; G.kills = 0; G.choices = {};
+    G.hasKnife = false;
+    fadeTo('TITLE');
+  }
+});
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+let last = 0;
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((ts - last) / 1000, .05);
+  last = ts;
+  G.time += dt;
+
+  // Update
+  updateTransition(dt);
+  switch (G.state) {
+    case 'TITLE':        updateTitle(dt);       break;
+    case 'ALLEY':        updateAlley(dt);       break;
+    case 'CITY1':        updateCity1(dt);       break;
+    case 'PHONE_OFFER':  updatePhoneOffer(dt);  break;
+    case 'PILLS_OFFER':  updatePillsOffer(dt);  break;
+    case 'SOCIAL_OFFER': updateSocialOffer(dt); break;
+    case 'GUN_OFFER':    updateGunOffer(dt);    break;
+    case 'ENDING':       updateEnding(dt);      break;
+  }
+
+  // Draw
+  ctx.clearRect(0, 0, W, H);
+  switch (G.state) {
+    case 'TITLE':        drawTitle();       break;
+    case 'ALLEY':        drawAlley();       break;
+    case 'CITY1':        drawCity1();       break;
+    case 'PHONE_OFFER':  drawPhoneOffer();  break;
+    case 'PILLS_OFFER':  drawPillsOffer();  break;
+    case 'SOCIAL_OFFER': drawSocialOffer(); break;
+    case 'GUN_OFFER':    drawGunOffer();    break;
+    case 'ENDING':       drawEnding();      break;
+  }
+
+  if (G.state !== 'TITLE' && G.state !== 'ENDING') drawHUD();
+  drawGrain();
+  drawTransition();
+}
+
+// Boot
+startScene('TITLE');
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
